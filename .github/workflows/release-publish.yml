@@ -1,0 +1,81 @@
+name: Publish Merged Release
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [develop]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: create-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: >-
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'release/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - name: Checkout merged release commit
+      uses: actions/checkout@v7
+      with:
+        ref: ${{ github.event.pull_request.merge_commit_sha }}
+        fetch-depth: 0
+
+    - name: Validate merged release
+      id: version
+      shell: bash
+      env:
+        RELEASE_BRANCH: ${{ github.event.pull_request.head.ref }}
+      run: |
+        VERSION="${RELEASE_BRANCH#release/}"
+        bash .github/scripts/validate-release-version.sh "$VERSION"
+        if [[ $(grep -c '^VERSION=' Makefile) != 1 || $(sed -n 's/^VERSION=//p' Makefile) != "$VERSION" ]]; then
+          echo "::error::Release branch version does not match the merged Makefile version."
+          exit 1
+        fi
+        if ! grep -Eq "^[0-9]{4}-[0-9]{2}-[0-9]{2} Released MrBig ${VERSION//./\\.}$" ChangeLog; then
+          echo "::error::Missing Released MrBig $VERSION entry in ChangeLog."
+          exit 1
+        fi
+        bash format-changelog.sh ChangeLog --dry-run
+        echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+    - name: Install MinGW cross-compilers
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y make mingw-w64 binutils-mingw-w64 zip
+
+    - name: Build MrBig
+      run: make all
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v7
+      with:
+        name: mrbig-binaries-${{ steps.version.outputs.version }}
+        path: |
+          X64/mrbig64.exe
+          X86/mrbig.exe
+        if-no-files-found: error
+
+    - name: Tag and publish merged release
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git tag -a "$VERSION" -m "Release $VERSION"
+        git push origin "refs/tags/$VERSION"
+        release_args=(--latest)
+        if [[ "$VERSION" == *-rc* ]]; then
+          release_args=(--prerelease --latest=false)
+        fi
+        gh release create "$VERSION" X86/mrbig.exe X64/mrbig64.exe \
+          --verify-tag --title "$VERSION" --generate-notes "${release_args[@]}"

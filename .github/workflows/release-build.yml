@@ -1,11 +1,24 @@
-name: Create Release
+name: Prepare Release
 
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: "Version without v, e.g. 0.26.7 or 0.26.8-rc1"
+      major:
+        description: "Major version (0-65535, no leading zeros)"
         required: true
+        type: string
+      minor:
+        description: "Minor version (0-65535, no leading zeros)"
+        required: true
+        type: string
+      build:
+        description: "Build version (0-65535, no leading zeros)"
+        required: true
+        type: string
+      tag:
+        description: "Optional prerelease suffix, e.g. rc1 (NO -); leave blank for stable"
+        required: false
+        default: ""
         type: string
 
 permissions:
@@ -16,11 +29,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
+  prepare:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 5
     env:
-      VERSION: ${{ inputs.version }}
+      MAJOR: ${{ inputs.major }}
+      MINOR: ${{ inputs.minor }}
+      BUILD: ${{ inputs.build }}
+      TAG: ${{ inputs.tag }}
 
     steps:
     - name: Checkout code
@@ -28,60 +44,67 @@ jobs:
       with:
         fetch-depth: 0
 
-    - name: Validate and commit version
+    - name: Validate release version
+      id: version
       shell: bash
       run: |
-        if [[ "$GITHUB_REF_TYPE" != branch ]]; then
-          echo "::error::Select a branch when running this workflow."
+        if [[ "$GITHUB_REF_TYPE" != branch || "$GITHUB_REF_NAME" != develop ]]; then
+          echo "::error::Run this workflow on develop."
           exit 1
         fi
-        if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc[1-9][0-9]*)?$ ]]; then
-          echo "::error::Version must be X.Y.Z or X.Y.Z-rcN, without a v prefix or leading zeros."
+        for component in MAJOR MINOR BUILD; do
+          value="${!component}"
+          if [[ ! "$value" =~ ^(0|[1-9][0-9]{0,4})$ ]]; then
+            echo "::error::$component must be an integer from 0 to 65535 without leading zeros."
+            exit 1
+          fi
+          if (( value > 65535 )); then
+            echo "::error::$component must not exceed 65535."
+            exit 1
+          fi
+        done
+        if [[ -n "$TAG" && ! "$TAG" =~ ^rc[1-9][0-9]*$ ]]; then
+          echo "::error::Tag must be blank for stable or rcN with a positive number and no leading zeros."
           exit 1
         fi
-        if git show-ref --verify --quiet "refs/tags/v$VERSION"; then
-          echo "::error::Tag v$VERSION already exists."
-          exit 1
+        VERSION="$MAJOR.$MINOR.$BUILD"
+        if [[ -n "$TAG" ]]; then
+          VERSION="$VERSION-$TAG"
         fi
+        bash .github/scripts/validate-release-version.sh "$VERSION"
         if [[ $(grep -c '^VERSION=' Makefile) != 1 ]]; then
           echo "::error::Expected exactly one VERSION assignment in Makefile."
           exit 1
         fi
+        echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+    - name: Commit release preparation
+      shell: bash
+      run: |
+        if [[ $(sed -n 's/^VERSION=//p' Makefile) == "$VERSION" ]]; then
+          echo "::error::Makefile already contains $VERSION; choose a new version."
+          exit 1
+        fi
+        git switch -c "release/$VERSION"
         sed -i "s/^VERSION=.*/VERSION=$VERSION/" Makefile
+        changelog_tmp=$(mktemp)
+        printf '%s Released MrBig %s\n\n' "$(date -u +%F)" "$VERSION" > "$changelog_tmp"
+        cat ChangeLog >> "$changelog_tmp"
+        mv "$changelog_tmp" ChangeLog
+        bash format-changelog.sh ChangeLog --dry-run
         git config user.name "github-actions[bot]"
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-        git add Makefile
-        if ! git diff --cached --quiet; then
-          git commit -m "Release v$VERSION"
-        fi
+        git add Makefile ChangeLog
+        git commit -m "Prepare release $VERSION"
 
-    - name: Install MinGW cross-compilers
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y make mingw-w64 binutils-mingw-w64 zip
-
-    - name: Build MrBig
-      run: make all
-
-    - name: Upload build artifacts
-      uses: actions/upload-artifact@v7
-      with:
-        name: mrbig-binaries-${{ inputs.version }}
-        path: |
-          X64/mrbig64.exe
-          X86/mrbig.exe
-        if-no-files-found: error
-
-    - name: Tag, push, and publish release
+    - name: Push release branch and show PR link
       shell: bash
       env:
-        GH_TOKEN: ${{ github.token }}
+        SERVER_URL: ${{ github.server_url }}
       run: |
-        git tag -a "v$VERSION" -m "Release v$VERSION"
-        git push --atomic origin "HEAD:refs/heads/$GITHUB_REF_NAME" "refs/tags/v$VERSION"
-        release_args=(--latest)
-        if [[ "$VERSION" == *-rc* ]]; then
-          release_args=(--prerelease --latest=false)
-        fi
-        gh release create "v$VERSION" X86/mrbig.exe X64/mrbig64.exe \
-          --verify-tag --title "v$VERSION" --generate-notes "${release_args[@]}"
+        git push origin "HEAD:refs/heads/release/$VERSION"
+        pr_url="$SERVER_URL/$GITHUB_REPOSITORY/compare/develop...release/$VERSION?expand=1"
+        echo "Open the release PR: $pr_url"
+        printf '## Release %s prepared\n\n[Open a PR into develop](%s).\n\nMerge it after the PR checks pass to publish automatically.\n' \
+          "$VERSION" "$pr_url" >> "$GITHUB_STEP_SUMMARY"
