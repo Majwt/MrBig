@@ -23,6 +23,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 concurrency:
   group: create-release
@@ -98,13 +99,16 @@ jobs:
         git add Makefile ChangeLog
         git commit -m "Prepare release $VERSION"
 
-    - name: Push release branch and show PR link
+    - name: Push release branch and create PR
       shell: bash
       env:
-        SERVER_URL: ${{ github.server_url }}
+        GH_TOKEN: ${{ github.token }}
       run: |
         git push origin "HEAD:refs/heads/release/$VERSION"
-        pr_url="$SERVER_URL/$GITHUB_REPOSITORY/compare/develop...release/$VERSION?expand=1"
-        echo "Open the release PR: $pr_url"
-        printf '## Release %s prepared\n\n[Open a PR into develop](%s).\n\nMerge it after the PR checks pass to publish automatically.\n' \
+        pr_url=$(gh pr create --repo "$GITHUB_REPOSITORY" \
+          --base develop --head "release/$VERSION" \
+          --title "Release $VERSION" \
+          --body "Updates the Makefile version and ChangeLog for MrBig $VERSION. Merging this PR publishes the release automatically. Required PR checks do not run automatically for PRs created with GITHUB_TOKEN; close and reopen this PR manually to trigger them.")
+        echo "Created release PR: $pr_url"
+        printf '## Release %s prepared\n\n[Release PR](%s).\n\nClose and reopen the PR manually to trigger PR checks, then merge after they pass to publish automatically.\n' \
           "$VERSION" "$pr_url" >> "$GITHUB_STEP_SUMMARY"
