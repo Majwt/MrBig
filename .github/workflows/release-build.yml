@@ -1,59 +1,110 @@
-name: release-build
+name: Prepare Release
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
+    inputs:
+      major:
+        description: "Major version (0-65535, no leading zeros)"
+        required: true
+        type: string
+      minor:
+        description: "Minor version (0-65535, no leading zeros)"
+        required: true
+        type: string
+      build:
+        description: "Build version (0-65535, no leading zeros)"
+        required: true
+        type: string
+      tag:
+        description: "Optional prerelease suffix, e.g. rc1 (NO -); leave blank for stable"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
 
+concurrency:
+  group: create-release
+  cancel-in-progress: false
+
 jobs:
-  build:
+  prepare:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      MAJOR: ${{ inputs.major }}
+      MINOR: ${{ inputs.minor }}
+      BUILD: ${{ inputs.build }}
+      TAG: ${{ inputs.tag }}
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
 
-    - name: Install MinGW cross-compilers
+    - name: Validate release version
+      id: version
+      shell: bash
       run: |
-        sudo apt-get update
-        sudo apt-get install -y make mingw-w64 binutils-mingw-w64 zip
-
-    - name: Verify tag matches Makefile version
-      if: github.event_name == 'release'
-      run: |
-        TAG="${GITHUB_REF_NAME#v}"
-        MAKEFILE_VERSION=$(grep -m1 '^VERSION=' Makefile | cut -d= -f2)
-        if [ "$TAG" != "$MAKEFILE_VERSION" ]; then
-          echo "Tag version ($TAG) does not match Makefile version ($MAKEFILE_VERSION)"
+        if [[ "$GITHUB_REF_TYPE" != branch || "$GITHUB_REF_NAME" != develop ]]; then
+          echo "::error::Run this workflow on develop."
           exit 1
         fi
-
-    - name: Build MrBig
-      run: |
-        TAG="${GITHUB_REF_NAME#v}"
-        if [ "${{ github.event_name }}" = "release" ] && [ -n "$TAG" ]; then
-          make all VERSION="$TAG"
-        else
-          make all
+        for component in MAJOR MINOR BUILD; do
+          value="${!component}"
+          if [[ ! "$value" =~ ^(0|[1-9][0-9]{0,4})$ ]]; then
+            echo "::error::$component must be an integer from 0 to 65535 without leading zeros."
+            exit 1
+          fi
+          if (( value > 65535 )); then
+            echo "::error::$component must not exceed 65535."
+            exit 1
+          fi
+        done
+        if [[ -n "$TAG" && ! "$TAG" =~ ^rc[1-9][0-9]*$ ]]; then
+          echo "::error::Tag must be blank for stable or rcN with a positive number and no leading zeros."
+          exit 1
         fi
+        VERSION="$MAJOR.$MINOR.$BUILD"
+        if [[ -n "$TAG" ]]; then
+          VERSION="$VERSION-$TAG"
+        fi
+        bash .github/scripts/validate-release-version.sh "$VERSION"
+        if [[ $(grep -c '^VERSION=' Makefile) != 1 ]]; then
+          echo "::error::Expected exactly one VERSION assignment in Makefile."
+          exit 1
+        fi
+        echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-    - name: Upload build artifacts
-      if: github.event_name == 'release'
-      uses: actions/upload-artifact@v7
-      with:
-        name: mrbig-binaries
-        path: |
-          X64/mrbig64.exe
-          X86/mrbig.exe
-        if-no-files-found: warn
+    - name: Commit release preparation
+      shell: bash
+      run: |
+        if [[ $(sed -n 's/^VERSION=//p' Makefile) == "$VERSION" ]]; then
+          echo "::error::Makefile already contains $VERSION; choose a new version."
+          exit 1
+        fi
+        git switch -c "release/$VERSION"
+        sed -i "s/^VERSION=.*/VERSION=$VERSION/" Makefile
+        changelog_tmp=$(mktemp)
+        printf '%s Released MrBig %s\n\n' "$(date -u +%F)" "$VERSION" > "$changelog_tmp"
+        cat ChangeLog >> "$changelog_tmp"
+        mv "$changelog_tmp" ChangeLog
+        bash format-changelog.sh ChangeLog --dry-run
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add Makefile ChangeLog
+        git commit -m "Prepare release $VERSION"
 
-    - name: Upload Release Assets
-      if: github.event_name == 'release'
-      uses: softprops/action-gh-release@v3
-      with:
-        files: |
-          X64/mrbig64.exe
-          X86/mrbig.exe
+    - name: Push release branch and show PR link
+      shell: bash
+      env:
+        SERVER_URL: ${{ github.server_url }}
+      run: |
+        git push origin "HEAD:refs/heads/release/$VERSION"
+        pr_url="$SERVER_URL/$GITHUB_REPOSITORY/compare/develop...release/$VERSION?expand=1"
+        echo "Open the release PR: $pr_url"
+        printf '## Release %s prepared\n\n[Open a PR into develop](%s).\n\nMerge it after the PR checks pass to publish automatically.\n' \
+          "$VERSION" "$pr_url" >> "$GITHUB_STEP_SUMMARY"
